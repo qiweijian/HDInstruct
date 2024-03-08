@@ -1,7 +1,7 @@
 from transformers import set_seed
 from vllm import LLM, SamplingParams
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Literal
 from collections import Counter
 from transformers import AutoTokenizer
 
@@ -16,6 +16,7 @@ class GenerationArguments:
     max_new_tokens: int = field(default=256, metadata={"help": "The maximum number of new tokens to generate"})
     batch_size: int = field(default=16, metadata={"help": "The batch size for generation"})
     tensor_parallel_size: int = field(default=2, metadata={"help": "The tensor parallel size"})
+    stop_sign: str = field(default=None, metadata={"help": "The stop token for generation"})
 
 
 
@@ -29,16 +30,21 @@ class vLLMWrapperForCompletionModel:
         )
         self.generation_args = generation_args
         set_seed(self.generation_args.seed)
+        self.update_sampling_params()
 
+    def update_sampling_params(self):
         self.sampling_params = SamplingParams(
             temperature=self.generation_args.temperature,
             top_p=self.generation_args.top_p,
             top_k=self.generation_args.top_k,
             n=self.generation_args.num_return_sequences,
             max_tokens=self.generation_args.max_new_tokens,
+            stop=self.generation_args.stop_sign
         )
         self.greedy_samp_params = SamplingParams(
-            best_of=1, temperature=0.0, top_p=1, top_k=-1, use_beam_search=False, max_tokens=self.generation_args.max_new_tokens
+            best_of=1, temperature=0.0, top_p=1, top_k=-1, use_beam_search=False, 
+            max_tokens=self.generation_args.max_new_tokens,
+            stop=self.generation_args.stop_sign
         )
     
     def prepare_prompts(self, prompts):
@@ -75,3 +81,12 @@ class vLLMWrapperForChatModel(vLLMWrapperForCompletionModel):
     def prepare_prompts(self, prompts):
         prompts = super().prepare_prompts(prompts)
         return self.chat_template_fn(prompts)
+
+def get_inference_model(generation_args: GenerationArguments):
+    if generation_args.model_type == "chat":
+        model = vLLMWrapperForChatModel(generation_args)
+    elif generation_args.model_type == "completion":
+        model = vLLMWrapperForCompletionModel(generation_args)
+    else:
+        raise ValueError(f"Invalid model type: {generation_args.model_type}")
+    return model
