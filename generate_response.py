@@ -8,6 +8,7 @@ from models import GenerationArguments, get_inference_model
 from tqdm import tqdm
 import json
 from dataclasses import dataclass, field
+import pandas as pd
 
 import wandb
 import time
@@ -19,26 +20,20 @@ class MyGenerationArguments(GenerationArguments):
     model_type: str = field(default="chat", metadata={"help": "The type of model to use for generation"})
     run_name: str = field(default="response_generation", metadata={"help": "The name of the run"})
 
-def generate_response(model, data, batch_size, template_fn, output_file):
-    p_bar = tqdm(total=len(data))
-    for i in range(0, len(data), batch_size):
-        batch = data[i:i+batch_size]
-        prompts = []
-        for example in batch:
-            template_input = example.copy()
-            template_input.pop('id')
-            template_input.pop('ground_truth')
-            prompts.append(template_fn(**template_input))
-        greedy_responses = model.greedy_generate(prompts)
-        sampling_responses = model.sampling_generate(prompts)
-        for j, example in enumerate(batch):
-            example['prompt'] = prompts[j]
-            example['greedy_response'] = greedy_responses[j]
-            example['sampling_response'] = sampling_responses[j]
-            json.dump(example, output_file, ensure_ascii=False, indent=4)
-            output_file.write(",\n")
-            p_bar.update(1)
-    return example # only for logging
+def generate_response(model, data, template_fn):
+    prompts = [template_fn(**{k: v for k, v in example.items() if k not in ['id', 'ground_truth']}) for example in data]
+    print(f"greedy responses for {len(prompts)} prompts")
+    greedy_responses = model.greedy_generate(prompts)
+    print(f"sampling responses for {len(prompts)} prompts")
+    sampling_responses = model.sampling_generate(prompts)
+
+    return pd.DataFrame({
+        "id": [example["id"] for example in data], 
+        "prompt": prompts, 
+        "ground_truth": [example["ground_truth"] for example in data], 
+        "greedy_response": greedy_responses, 
+        "sampling_response": sampling_responses,
+    })
     
 def create_output_dir(run_name):
     output_dir = f"./outputs/{run_name}"
@@ -79,8 +74,9 @@ def main():
     wandb.config['output'] = []
 
     model = get_inference_model(generation_args)
+    ds_names = ["coqa", "nq", "squad", "triviaqa"]
 
-    for ds_name in ["coqa", "nq", "squad", "triviaqa"]:
+    for ds_name in ds_names:
         if generation_args.is_debug:
             ds_path = f"./data/debug/{ds_name}_sample.json"
             print(f"Debug mode: Using sampled {ds_name} dataset")
@@ -98,17 +94,16 @@ def main():
         model.update_sampling_params()
 
         print(f"Generating responses for {ds_name} dataset")
-        output_path = os.path.join(output_dir, f"{ds_name}_responses.json")
-        with open(output_path, "w") as output_file:
-            output_file.write("[\n")
-            last_example = generate_response(model, data, batch_size, template_fn, output_file)
-            output_file.seek(output_file.tell()-2)
-            output_file.write("\n]")
-
+        df = generate_response(model, data, template_fn)
+        output_path = os.path.join(output_dir, f"{ds_name}_responses.jsonl")
+        df.to_json(output_path, orient="records", lines=True)
+        print(f"Responses saved to {output_path}")
         # log last example
-        generate_example_table.add_data(*[str(last_example[k]) for k in log_columns])
+        last_row = df.iloc[-1].to_dict()
+        generate_example_table.add_data(*[str(last_row[k]) for k in log_columns])
         wandb.config['output'].append(output_path)
-        
+
+    model.delete_model()
     wandb.log({"generated_responses": generate_example_table})
     wandb.finish()
             
