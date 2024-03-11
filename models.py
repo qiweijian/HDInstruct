@@ -1,9 +1,12 @@
 from transformers import set_seed
 from vllm import LLM, SamplingParams
+from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
 from dataclasses import dataclass, field
 from typing import List, Literal
 from collections import Counter
 from transformers import AutoTokenizer
+import gc
+import torch
 
 @dataclass
 class GenerationArguments:
@@ -26,6 +29,7 @@ class vLLMWrapperForCompletionModel:
             model=generation_args.model_name,
             tokenizer=generation_args.model_name,
             tensor_parallel_size=generation_args.tensor_parallel_size,
+            gpu_memory_utilization=0.85,
             max_model_len=2048
         )
         self.generation_args = generation_args
@@ -54,15 +58,22 @@ class vLLMWrapperForCompletionModel:
     
     def greedy_generate(self, prompts):
         prompts = self.prepare_prompts(prompts)
-        greedy_request_output = self.model.generate(prompts, sampling_params=self.greedy_samp_params, use_tqdm=False)
+        greedy_request_output = self.model.generate(prompts, sampling_params=self.greedy_samp_params)
         return [one_request.outputs[0].text for one_request in greedy_request_output]
     
     def sampling_generate(self, prompts) -> List[Counter]:
         prompts = self.prepare_prompts(prompts)
-        samp_request_output = self.model.generate(prompts=prompts, sampling_params=self.sampling_params, use_tqdm=False)
+        samp_request_output = self.model.generate(prompts=prompts, sampling_params=self.sampling_params)
         samp_texts = [[cpl.text for cpl in one_request.outputs if cpl.text.strip()] for one_request in samp_request_output]
         samp_texts_counter = [Counter(texts) for texts in samp_texts]
         return samp_texts_counter
+    
+    def delete_model(self):
+        destroy_model_parallel()
+        del self.model
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.distributed.destroy_process_group()
 
 
 class vLLMWrapperForChatModel(vLLMWrapperForCompletionModel):
