@@ -23,14 +23,12 @@ def compute_correctness(df):
                 best_rouge, best_rouge_match = rouge, gt
             if similarity > best_similarity:
                 best_similarity, best_similarity_match = similarity, gt
-        d.update({
-            "rouge": best_rouge,
-            "rouge_correctness": best_rouge > ROUGE_THRESHOLD, # "correct" if best_rouge > ROUGE_THRESHOLD else "incorrect"
-            "best_rouge_match": best_rouge_match,
-            "cosine_similarity": best_similarity,
-            "similarity_correctness": best_similarity > SIMILARITY_THRESHOLD, # "correct" if best_similarity > SIMILARITY_THRESHOLD else "incorrect"
-            "best_similariy_match": best_similarity_match
-        })
+        df.loc[i, "rouge"] = best_rouge
+        df.loc[i, "rouge_correctness"] = best_rouge > ROUGE_THRESHOLD
+        df.loc[i, "best_rouge_match"] = best_rouge_match
+        df.loc[i, "cosine_similarity"] = best_similarity
+        df.loc[i, "similarity_correctness"] = best_similarity > SIMILARITY_THRESHOLD
+        df.loc[i, "best_similariy_match"] = best_similarity_match
     return df
 
 def main():
