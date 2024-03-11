@@ -1,0 +1,11 @@
+{
+    "without_context": [
+        "Answer the question with a short word or phrase.",
+        "{question}"
+    ],
+    "with_context": [
+        "Based on the following passage, answer the question with a short word or phrase.\n",
+        "Passage: {context}",
+        "Question: {question}"
+    ]
+}
