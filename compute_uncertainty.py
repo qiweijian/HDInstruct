@@ -17,39 +17,6 @@ from collections import Counter
 from rouge_score.rouge_scorer import RougeScorer
 rouge_scorer = RougeScorer(['rougeL'], use_stemmer=True)
 rouge_fn = lambda target, pred: rouge_scorer.score(target, pred)['rougeL'].fmeasure
-
-def prepare_inputs(prompt, generations, tokenizer):
-    prompt_encoded = tokenizer(prompt, return_tensors="pt", padding=True)
-    full_sentences = [f"{prompt}{generation}{tokenizer.eos_token}" for generation in generations] # add eos token is for eigen score
-    full_sentences_encoded = tokenizer(full_sentences, return_tensors="pt", padding=True)
-    return prompt_encoded, full_sentences_encoded
-
-def mask_logits_for_perplexity(logits, attention_mask):
-    # eos tokens should be ignored when computing perplexity
-    extended_mask = torch.cat([attention_mask, torch.zeros(attention_mask.shape[0], 1, dtype=torch.long)], dim=1)
-    shifted_attention_mask = extended_mask[:, 1:]
-    return logits.masked_fill(~shifted_attention_mask.bool().unsqueeze(-1), float('nan'))
-
-
-def compute_logits_and_hidden_states(prompt_encoded, full_sentences_encoded, model, layer=15):
-    prompt_length = prompt_encoded['input_ids'].shape[1]
-    batch_size = full_sentences_encoded['input_ids'].shape[0]
-    with torch.no_grad():
-        prompt_output = model(**prompt_encoded)
-        batched_prompt_pkv = [(k.repeat(batch_size, 1, 1, 1), v.repeat(batch_size, 1, 1,1)) for k, v in prompt_output.past_key_values]
-        full_sentences_encoded['input_ids'] = full_sentences_encoded['input_ids'][:, prompt_length:]
-        full_sentences_output = model(**full_sentences_encoded, past_key_values=batched_prompt_pkv, output_hidden_states=True)
-    # slice the attention_mask to remove the prompt
-    attention_mask = full_sentences_encoded['attention_mask'][:, prompt_length:]
-    answer_logits =  torch.cat(
-        [prompt_output.logits[:,-1,:].repeat(batch_size, 1, 1), full_sentences_output.logits[:, :-1, :]], 
-        dim=1
-    )
-    answer_logits = mask_logits_for_perplexity(answer_logits, attention_mask)
-    # select the eos hidden states
-    eos_indices = attention_mask.sum(dim=1) - 1
-    eos_hidden_states = full_sentences_output.hidden_states[layer][range(batch_size), eos_indices]
-    return answer_logits, eos_hidden_states
     
 def compute_perplexities(logits: torch.tensor, input_ids: torch.tensor):
     assert logits.shape[:2] == input_ids.shape
@@ -74,18 +41,58 @@ def manual_check_sentence(sentence):
         return sentence.split("Q: ")[0]
     else:
         return sentence
+    
+def find_common_prefix(sequences):
+    common_prefix = []
+    for i in range(min(len(seq) for seq in sequences)):
+        current = sequences[0][i]
+        if all(seq[i] == current for seq in sequences):
+            common_prefix.append(current)
+        else:
+            break
+    return common_prefix
 
 def compute_uncertainty(df, model, tokenizer, dataset_name):
     
-    total_prompts = df['prompt']
-    common_prefix = os.path.commonprefix(total_prompts) # find the common (instruction+example) prefix
-    common_prefix_encoded = tokenizer(common_prefix, return_tensors="pt")
-    common_prefix_kv = model(**common_prefix_encoded)['past_key_values']
+    total_prompts = list(df['prompt'])
+    total_prompts_ids = tokenizer(total_prompts, padding=False)['input_ids']
+    common_prefix_ids = find_common_prefix(total_prompts_ids)
+    common_prefix_kv = model(input_ids=torch.tensor([common_prefix_ids])).past_key_values
 
+    for i, row in tqdm(df.iterrows(), total=len(df), desc=f"Calculating uncertainty for {dataset_name}"):
+        # prepare inputs
+        p_ids = total_prompts_ids[i]
+        responses = [row['greedy_response']]+list(row['sampling_response'].keys())
+        full_sentences = [f"{total_prompts[i]}{r}{tokenizer.eos_token}" for r in responses]
+        full_sentences_encoded = tokenizer(full_sentences, return_tensors="pt", padding=True)
 
-    for i, row in tqdm(df.iterrows(), total=len(df), desc=f"Calculating uncertainty for {dataset_name}"):   
-        prompt_encoded, full_sentences_encoded = prepare_inputs(row['prompt'], [row['greedy_response']]+list(row['sampling_response'].keys()), tokenizer)
-        answer_logits, eos_hidden_states = compute_logits_and_hidden_states(prompt_encoded, full_sentences_encoded, model)
+        # forward prompt
+        prompt_encoded = {
+            'input_ids': torch.tensor([p_ids[len(common_prefix_ids):]]),
+            'past_key_values': common_prefix_kv,
+            'attention_mask': torch.ones(1, len(p_ids), dtype=torch.long) # we need to send the full length of the prompt
+        }
+        prompt_output = model(**prompt_encoded)
+
+        # forward responses
+        batch_size = len(responses)
+        batched_prompt_pkv = [(k.repeat(batch_size, 1, 1, 1), v.repeat(batch_size, 1, 1,1)) for k, v in prompt_output.past_key_values]
+        full_sentences_encoded['input_ids'] = full_sentences_encoded['input_ids'][:, len(p_ids):]
+        full_sentences_output = model(**full_sentences_encoded, past_key_values=batched_prompt_pkv, output_hidden_states=True)
+
+        # post-process the logits and hidden states
+        prompt_length = len(p_ids)
+        ## logits for predicting next token
+        answer_logits =  torch.cat(
+            [prompt_output.logits[:,-1,:].repeat(batch_size, 1, 1), full_sentences_output.logits[:, :-1, :]], 
+            dim=1
+        )
+        # mask the logits at padding
+        attention_mask = full_sentences_encoded['attention_mask'][:, prompt_length:]
+        extended_mask = torch.cat([attention_mask, torch.zeros(attention_mask.shape[0], 1, dtype=torch.long)], dim=1)
+        shifted_attention_mask = extended_mask[:, 1:]
+        answer_logits = answer_logits.masked_fill(~shifted_attention_mask.bool().unsqueeze(-1), float('nan'))
+
         perplexities = compute_perplexities(answer_logits, full_sentences_encoded['input_ids'])
         if not row['greedy_response']: # if the greedy response is empty, set the perplexity to a very high value
             perplexities[0] = 1000 
@@ -97,7 +104,11 @@ def compute_uncertainty(df, model, tokenizer, dataset_name):
         ln_entropy = np.average(perplexities[1:], weights=weights)
         energy_score = compute_energy_score(answer_logits)
         energy_score = np.average(energy_score[1:], weights=weights)
+
         # hidden states based metrics
+        layer = model.config.num_hidden_layers // 2 - 1
+        eos_indices = attention_mask.sum(dim=1) - 1
+        eos_hidden_states = full_sentences_output.hidden_states[layer][range(batch_size), eos_indices]
         eos_hidden_states = eos_hidden_states[1:, :] # remove the greedy generation
         eos_hidden_states = torch.cat(
             [eos_hidden_states[i].repeat(weights[i], 1) for i in range(len(weights))], 
@@ -146,7 +157,8 @@ def main():
         file_path = os.path.join(args.data_dir, f"{dataset_name}{file_suffix}")
         df = pd.read_json(file_path, orient="records", lines=True)
         
-        df = compute_uncertainty(df, model, tokenizer, dataset_name)
+        with torch.no_grad():
+            df = compute_uncertainty(df, model, tokenizer, dataset_name)
 
         tqdm.pandas(desc=f"Calculating lexical similarity for {dataset_name}")
         df['lexical_similarity'] = df.progress_apply(compute_similarity_for_row, axis=1, rouge_fn=rouge_fn)
