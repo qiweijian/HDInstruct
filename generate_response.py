@@ -18,8 +18,6 @@ class MyGenerationArguments(GenerationArguments):
     is_debug: bool = field(default=False, metadata={"help": "Whether to run in debug mode(only 100 sample from each dataset)"})
     model_type: str = field(default="chat", metadata={"help": "The type of model to use for generation"})
     run_name: str = field(default="response_generation", metadata={"help": "The name of the run"})
-    context_stop_sign: str = field(default=None, metadata={"help": "The stop token for context"})
-    question_stop_sign: str = field(default=None, metadata={"help": "The stop token for question"})
 
 def generate_response(model, data, batch_size, template_fn, output_file):
     p_bar = tqdm(total=len(data))
@@ -54,13 +52,15 @@ def create_output_dir(run_name):
     return output_dir
 
 def load_template(template_path):
-    templates = json.load(open(template_path))
+    # log the template file
     prompt_artifact = wandb.Artifact(name="template", type="prompt")
     prompt_artifact.add_file(template_path)
     wandb.log_artifact(prompt_artifact)
+
+    templates = json.load(open(template_path))
     context_template_fn = lambda question, context: '\n'.join(templates['with_context']).format(question=question, context=context)
     no_context_template_fn = lambda question: '\n'.join(templates['without_context']).format(question=question)
-    return context_template_fn, no_context_template_fn
+    return context_template_fn, no_context_template_fn, templates['context_stop_sign'], templates['question_stop_sign']
 
 def main():
     parser = HfArgumentParser(MyGenerationArguments)
@@ -71,7 +71,7 @@ def main():
     print(f"Generation Arguments: {generation_args}")
     
     output_dir = create_output_dir(generation_args.run_name)
-    context_template_fn, no_context_template_fn = load_template(generation_args.template_path)
+    context_template_fn, no_context_template_fn, context_stop_sign, question_stop_sign = load_template(generation_args.template_path)
     
     # we log one example for each dataset to better understand the generated responses
     log_columns = ["id", "prompt", "greedy_response", "ground_truth"]
@@ -91,10 +91,10 @@ def main():
         
         if 'context' in data[0]:
             template_fn = context_template_fn
-            model.generation_args.stop_sign = generation_args.context_stop_sign
+            model.generation_args.stop_sign = context_stop_sign
         else:
             template_fn = no_context_template_fn
-            model.generation_args.stop_sign = generation_args.question_stop_sign
+            model.generation_args.stop_sign = question_stop_sign
         model.update_sampling_params()
 
         print(f"Generating responses for {ds_name} dataset")
@@ -111,7 +111,6 @@ def main():
         
     wandb.log({"generated_responses": generate_example_table})
     wandb.finish()
-    return 0
             
 if __name__ == "__main__":
-    print(main())
+    main()
