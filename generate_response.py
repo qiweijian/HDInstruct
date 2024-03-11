@@ -4,7 +4,7 @@ os.environ["HTTPS_PROXY"]="http://127.0.0.1:7898"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 from transformers import HfArgumentParser
-from models import GenerationArguments, get_inference_model
+from inference_models import GenerationArguments, get_inference_model
 from tqdm import tqdm
 import json
 from dataclasses import dataclass, field
