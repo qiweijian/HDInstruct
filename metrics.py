@@ -11,4 +11,4 @@ def rouge_and_similarity_score(targets, preds):
     target_embeddings = se_model.encode(targets, show_progress_bar=False)
     prediction_embeddings = se_model.encode(preds, show_progress_bar=False)
     cosine_similarity = 1 - paired_cosine_distances(target_embeddings, prediction_embeddings)
-    return rouge_scores, cosine_similarity
+    return rouge_scores, cosine_similarity.tolist()
