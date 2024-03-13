@@ -59,10 +59,18 @@ def compute_uncertainty(df, model, tokenizer, dataset_name):
     common_prefix_ids = find_common_prefix(total_prompts_ids)
     common_prefix_kv = model(input_ids=torch.tensor([common_prefix_ids])).past_key_values
 
+    new_df = pd.DataFrame(columns=[
+        "id", "perplexity", "ln_entropy", "energy_score", "eigen_score", "lexical_similarity",
+        "rouge_correctness", "similarity_correctness"
+    ])
+
     for i, row in tqdm(df.iterrows(), total=len(df), desc=f"Calculating uncertainty for {dataset_name}"):
         # prepare inputs
         p_ids = total_prompts_ids[i]
         responses = [row['greedy_response']]+list(row['sampling_response'].keys())
+        if len(responses) == 0 or not any(responses):
+            print(f"Skipping row {i} as there are no responses")
+            continue
         full_sentences = [f"{total_prompts[i]}{r}{tokenizer.eos_token}" for r in responses]
         full_sentences_encoded = tokenizer(full_sentences, return_tensors="pt", padding=True)
 
@@ -96,14 +104,23 @@ def compute_uncertainty(df, model, tokenizer, dataset_name):
         perplexities = compute_perplexities(answer_logits, full_sentences_encoded['input_ids'])
         if not row['greedy_response']: # if the greedy response is empty, set the perplexity to a very high value
             perplexities[0] = 1000 
-        assert not any(np.isnan(perplexities))
+        sample_responses, sample_perplexities = [], []
+        for r, p in zip(responses[1:], perplexities[1:]):
+            if np.isnan(p):
+                print(f"row {i}: Perplexity for response {r} is nan")
+                continue
+            sample_responses.append(r)
+            sample_perplexities.append(p)
+        if not sample_responses:
+            print(f"Skipping row {i} as there are no valid responses")
+            continue
         
-        weights = list(row['sampling_response'].values())
+        weights = [row['sampling_response'][r] for r in sample_responses]
         # logits based metrics
         perplexity = perplexities[0]
-        ln_entropy = np.average(perplexities[1:], weights=weights)
+        ln_entropy = np.average(sample_perplexities, weights=weights)
         energy_score = compute_energy_score(answer_logits)
-        energy_score = np.average(energy_score[1:], weights=weights)
+        energy_score = np.average(sample_perplexities, weights=weights)
 
         # hidden states based metrics
         layer = model.config.num_hidden_layers // 2 - 1
@@ -115,21 +132,31 @@ def compute_uncertainty(df, model, tokenizer, dataset_name):
             dim=0
         )
         eigen_score = compute_eigen_score(eos_hidden_states)
+        # append to the new dataframe
+        index_to_append = len(new_df)
+        new_df.loc[index_to_append, 'id'] = row['id']
+        new_df.loc[index_to_append, 'perplexity'] = perplexity
+        new_df.loc[index_to_append, 'ln_entropy'] = ln_entropy
+        new_df.loc[index_to_append, 'energy_score'] = energy_score
+        new_df.loc[index_to_append, 'eigen_score'] = eigen_score
+        new_df.loc[index_to_append, 'rouge_correctness'] = row['rouge_correctness']
+        new_df.loc[index_to_append, 'similarity_correctness'] = row['similarity_correctness']
 
-        df.at[i, 'perplexity'] = perplexity
-        df.at[i, 'ln_entropy'] = ln_entropy
-        df.at[i, 'energy_score'] = energy_score
-        df.at[i, 'eigen_score'] = eigen_score
-    return df
+        # calculate the similarity
+        lexical_similarity = compute_similarity_for_row(row['sampling_response'])
+        new_df.loc[index_to_append, 'lexical_similarity'] = lexical_similarity
+    return new_df
 
-def compute_similarity_for_row(row, rouge_fn):
-    sentences = list(row['sampling_response'].keys())
+def compute_similarity_for_row(sampling_response: dict):
+    sentences = list(sampling_response.keys())
+    if len(sentences) < 2:
+        return 1
     sentence_pair_counter = Counter()
     same_pair_cnt = 0
     for i, sentence in enumerate(sentences):
-        same_pair_cnt += row['sampling_response'][sentence] * (row['sampling_response'][sentence] - 1) // 2
+        same_pair_cnt += sampling_response[sentence] * (sampling_response[sentence] - 1) // 2
         for j in range(i+1, len(sentences)):
-            sentence_pair_counter[(sentence, sentences[j])] = row['sampling_response'][sentence] * row['sampling_response'][sentences[j]]
+            sentence_pair_counter[(sentence, sentences[j])] = sampling_response[sentence] * sampling_response[sentences[j]]
     sentence_pair_counter['same'] = same_pair_cnt
     total_sims = total_pairs = 0
     for pair, cnt in sentence_pair_counter.items():
@@ -151,22 +178,17 @@ def main():
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "right"
 
-    file_suffix = "_correctness.json"
+    file_suffix = "_correctness.jsonl"
 
     for dataset_name in ["coqa", "triviaqa", "squad", "nq"]:
         file_path = os.path.join(args.data_dir, f"{dataset_name}{file_suffix}")
         df = pd.read_json(file_path, orient="records", lines=True)
+
+        if 'debug' in args.data_dir:
+            df = df[:10]
         
         with torch.no_grad():
             df = compute_uncertainty(df, model, tokenizer, dataset_name)
-
-        tqdm.pandas(desc=f"Calculating lexical similarity for {dataset_name}")
-        df['lexical_similarity'] = df.progress_apply(compute_similarity_for_row, axis=1, rouge_fn=rouge_fn)
-
-        # remove unnecessary columns
-        if 'context' in df.columns:
-            df = df.drop(columns=["context"])
-        df = df.drop(columns=["sampling_response", "prompt", "greedy_response", "best_rouge_match", "best_similariy_match"])
 
         save_path = os.path.join(args.data_dir, f"{dataset_name}_uncertainty.jsonl")
         df.to_json(save_path, lines=True, orient="records")
