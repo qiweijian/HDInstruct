@@ -56,11 +56,13 @@ class SuffixTuningModelForSequenceClassification(PeftModelForSequenceClassificat
         )
         # core model forward
         if isinstance(self.base_model, MistralForSequenceClassification) or isinstance(self.base_model, LlamaForSequenceClassification):
-            past_key_values = self.base_model.model(**kwargs).past_key_values
+            normal_output = self.base_model.model(**kwargs)
         elif isinstance(self.base_model, GPT2ForSequenceClassification):
-            past_key_values = self.base_model.transformer(**kwargs).past_key_values
+            normal_output = self.base_model.transformer(**kwargs)
         else:
             raise NotImplementedError(f"Model {self.base_model.__class__} not supported")
+        past_key_values = normal_output.past_key_values
+        # last_hidden_state_device = normal_output.last_hidden_state.device
         
         # do final token forward
         past_key_values = self.append_key_values(past_key_values, afterwards_key_values)
@@ -69,9 +71,14 @@ class SuffixTuningModelForSequenceClassification(PeftModelForSequenceClassificat
             'inputs_embeds': self.final_token(torch.zeros(batch_size, 1, dtype=torch.long).to(self.device)),
             'input_ids': None,
             'attention_mask': None,
-            'labels': labels,
+            # 'labels': labels.to(last_hidden_state_device), # 遇到了一个device问题，还是外面算吧
         })
-        return self.base_model(**kwargs)
+        final_output = self.base_model(**kwargs)
+        logits = final_output.logits
+        labels = labels.to(logits.device)
+        loss_fct = torch.nn.CrossEntropyLoss()
+        final_output['loss'] = loss_fct(logits.view(-1, self.base_model.num_labels), labels.view(-1)) # 神奇，不能用final_output.loss
+        return final_output
 
 
 
