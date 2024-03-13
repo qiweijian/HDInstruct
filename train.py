@@ -1,9 +1,4 @@
-import os
-os.environ["HTTP_PROXY"]="http://127.0.0.1:7898"
-os.environ["HTTPS_PROXY"]="http://127.0.0.1:7898"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
-from transformers import Trainer, TrainingArguments, AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding, HfArgumentParser
+from transformers import Trainer, TrainingArguments, AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding, HfArgumentParser, EarlyStoppingCallback
 from datasets import Dataset, load_from_disk
 import json
 from suffix_tuning_model import SuffixTuningModelForSequenceClassification, my_get_peft_config
@@ -86,6 +81,7 @@ if __name__ == "__main__":
         eval_dataset=dataset["test"],
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
     trainer.train()
 
